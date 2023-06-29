@@ -249,6 +249,9 @@ opengl_create_program(char *header_code, char *fragment_code)
 
   GLuint program_id = glCreateProgram();
   glAttachShader(program_id, fragment_shader_id);
+
+  glBindFragDataLocation(program_id, 0, "out_color");
+
   glLinkProgram(program_id);
 
   glValidateProgram(program_id);
@@ -257,7 +260,11 @@ opengl_create_program(char *header_code, char *fragment_code)
 
   result = program_id;
 
-  if (!linked_successfully)
+  if (linked_successfully)
+  {
+    glUseProgram(program_id);
+  }
+  else
   {
     GLsizei ignored = 0;
     char fragment_errors[4096] = ZERO_STRUCT;
@@ -288,7 +295,7 @@ opengl_init(void)
 
   IGNORE_WRITE_STRINGS();
   char *header_code = R"FOO(
-    #version 460
+    #version 150
     // Header code
     )FOO";
 
@@ -296,12 +303,23 @@ opengl_init(void)
     // Fragment code
     uniform float time;
     uniform vec2 resolution;
-    out vec4 colour;
+    out vec4 out_colour;
     void main(void)
     {
-      vec2 uv = gl_FragCoord.xy / resolution.xy;
-      vec3 col = 0.5 + 0.5*cos(time + uv.xyx + vec3(0, 2, 4));
-      colour = vec4(col, 1.0);
+      vec2 uv = (gl_FragCoord.xy / resolution.xy) * 2.0 - 1.0; // swizzling
+      uv.x *= resolution.x / resolution.y; // aspect ratio correction
+      // uv ranges from -1 to 1
+
+      float d = length(uv);
+      d = sin(d*8.0 + time) / 8.0;
+      d = abs(d);
+      d = smoothstep(0.0, 0.1, d);
+
+      // sdf of circle with radius 0.5
+      // sdf takes point and distance of that point to a given shape (used to draw shapes)
+      
+      //vec3 col = 0.5 + 0.5*cos(time + uv.xyx + vec3(0, 2, 4));
+      out_colour = vec4(d, 0.0, 0.0, 1.0);
     }
     )FOO";
   IGNORE_WARNING_POP();
@@ -364,6 +382,11 @@ main(int argc, char *argv[])
   DBG("Linked with SDL2 %u.%u.%u\n", 
        sdl2_version_linked.major, sdl2_version_linked.minor, sdl2_version_linked.patch);
 
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+  SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
   SDL_Window *window = SDL_CreateWindow("app", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                         window_width, window_height, SDL_WINDOW_OPENGL);
 
@@ -372,19 +395,19 @@ main(int argc, char *argv[])
     FATAL_ERROR("Failed to create SDL2 window.", SDL_GetError(), "");
   }
 
-  SDL_Renderer *sdl2_renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-  if (sdl2_renderer == NULL)
+  SDL_GLContext gl_context = SDL_GL_CreateContext(window);
+  if (gl_context == NULL)
   {
-    FATAL_ERROR("Failed to create SDL2 renderer.", SDL_GetError(), "");
+    FATAL_ERROR("Failed to create SDL2 opengl context.", SDL_GetError(), "");
   }
+  SDL_GL_SetSwapInterval(1);
 
-  if (SDL_SetRenderDrawBlendMode(sdl2_renderer, SDL_BLENDMODE_BLEND) != 0)
-  {
-    FATAL_ERROR("Failed to set SDL2 renderer blend mode.", SDL_GetError(), "");
-  }
-
+  glewExperimental = GL_TRUE;
   GLenum err = glewInit();
-  ASSERT(err == GLEW_OK);
+  if (err != GLEW_OK)
+  {
+    FATAL_ERROR("Failed to initialise glew.", (char *)glewGetErrorString(err), "");
+  }
 
   OpenGLInfo opengl_info = opengl_get_info();
   OpenGL opengl = opengl_init();
@@ -437,7 +460,6 @@ main(int argc, char *argv[])
   app_state->debugger_present = global_debugger_present;
 
   Renderer *renderer = MEM_ARENA_PUSH_STRUCT(linux_mem_arena_perm, Renderer);
-  renderer->renderer = sdl2_renderer;
   renderer->render_width = (u32)render_width;
   renderer->render_height = (u32)render_height;
   renderer->window_width = (u32)window_width;
@@ -448,7 +470,6 @@ main(int argc, char *argv[])
   b32 want_to_run = true;
   while (want_to_run)
   {
-    glViewport(0, 0, window_width, window_height);
 
     glUniform2f(opengl.resolution_id, window_width, window_height);
     glUniform1f(opengl.time_id, SDL_GetTicks() / 500.0f);
@@ -527,74 +548,11 @@ main(int argc, char *argv[])
 
     }
 
-    u64 app_mod_time = linux_get_file_mod_time(app_name);
-    if (app_mod_time > last_app_reload_time)
-    {
-      if (app_lib != NULL) 
-      {
-        dlclose(app_lib);
-      }
-
-      s8_copy_file(mem_arena_temp.arena, app_name, app_temp_abs_path);
-      struct stat app_stat = ZERO_STRUCT;
-      stat((char *)app_name.str, &app_stat);
-      chmod((char *)app_temp_abs_path.str, app_stat.st_mode);
-
-      // TODO(Ryan): This will fail as it seems detects file change before can actually load.
-      // So, will successfully load on subsequent calls
-      // However, get brief flicker
-      app_lib = dlopen((char *)app_temp_abs_path.str, RTLD_NOW);
-
-      if (app_lib != NULL) 
-      {
-        app = (app_func)dlsym(app_lib, "app");
-        if (app != NULL)
-        {
-          last_app_reload_time = app_mod_time;
-        }
-        else
-        {
-          WARN("Failed to load app from shared library.", strerror(errno));
-          app = NULL;
-        }
-      }
-      else
-      {
-        WARN("Failed to open app shared library.", strerror(errno));
-        app = NULL;
-      }
-    }
-
-    if (app != NULL)
-    {
-      app_state->ms = linux_get_ms();
-
-      SDL_GetWindowSize(window, &window_width, &window_height);
-      renderer->window_width = (u32)window_width;
-      renderer->window_height = (u32)window_height;
-
-      const u8 *keyboard_state = SDL_GetKeyboardState(NULL);
-      input->move_left = keyboard_state[SDL_SCANCODE_LEFT];
-      input->move_right = keyboard_state[SDL_SCANCODE_RIGHT];
-      input->move_up = keyboard_state[SDL_SCANCODE_SPACE];
-
-      sdl2_map_window_mouse_to_render_mouse(renderer, input);
-
-      // fps calculation?
-      // vsync more accurate than OS scheduler granularity
-      // IMPORTANT(Ryan): Still technically variable-delta-time, so not deterministic
-      app(app_state, renderer, input, linux_mem_arena_perm);
-
-      input->bullet_fired = false;
-      input->mouse_clicked = false;
-    }
-    else
-    {
-      //DrawText("Failed to load app.", 200, 200, 20, RED);
-    }
-
     mem_arena_scratch_release(mem_arena_temp);
 
+    glViewport(0, 0, window_width, window_height);
+    glClearColor(1.0f, 0.0f, 1.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
     glRecti(-1, -1, 1, 1);
     SDL_GL_SwapWindow(window);
   }
