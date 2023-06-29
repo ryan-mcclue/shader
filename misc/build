@@ -1,0 +1,282 @@
+#!/bin/bash
+
+set -oue pipefail
+
+if [[ "$1" != "app" && "$1" != "tests" ]]; then
+  printf "Usage: ./build <app|tests>\n" >&2
+  exit 1
+fi
+
+BUILD_TYPE="$1"
+
+# TODO(Ryan): Perhaps do a prepass of code base and check for TODO() comment dates and see if they have expired
+
+# IMPORTANT(Ryan): Every day start by running print_stats script that will display gnu plot graphs
+
+build_start_time=$(date +%s.%N)
+
+# TODO(Ryan): Print number of lexer lines processed, i.e. gcc -E
+print_metrics() {
+  if [[ "$BUILD_TYPE" == "app" ]]; then
+    : '
+    flow_lines=()
+    while IFS= read -r flow_line; do
+      flow_lines+=( "$flow_line" )
+    done < <(cflow --include-dir=external code/linux-main.cpp --omit-arguments --omit-symbol-name 2>/dev/null)
+  
+    function_names=()
+    function_call_count=()
+    for ((i = 0 ; i < ${#flow_lines[@]}; i++)); do
+      line_length=${#flow_lines[$i]}
+      read lstrip_line <<< "${flow_lines[$i]}"
+      function_name="${lstrip_line%% *}"
+      lstrip_line_length=${#lstrip_line}
+      line_indentation=$(( line_length - lstrip_line_length ))
+      printf "function: %s, indentation: %d\n" "$function_name" $line_indentation
+    done
+    '
+  
+    # IMPORTANT(Ryan): Must run with universal ctags
+    ctags --c-kinds=f --fields=+ne -o - code/* | awk '
+    BEGIN { 
+      max_line_range = 0
+      max_function_name = ""
+      line_start_temp = 0
+      line_end_temp = 0
+      max_line_range_temp = 0
+    }
+    {
+      for (i = 1; i <= NF; i++) {
+        if (index($i, "line:") != 0) {
+          line_start_temp = substr($i, 6)
+        }
+      if (index($i, "end:") != 0) {
+        line_end_temp = substr($i, 5)
+      }
+    }
+    max_line_range_temp = line_end_temp - line_start_temp 
+    if (max_line_range_temp >= max_line_range) {
+      max_line_range = max_line_range_temp
+      max_function_name = $1
+    }
+    } END {
+      printf("Longest function %s():%d lines\n", max_function_name, max_line_range)
+    }
+    '
+  
+    lines_of_code=$(cat code/* | wc -l)
+    printf "LOC: %d\n" $lines_of_code
+  
+    # IMPORTANT(Ryan): This does not show debug information
+    # Also assuming .bss negligable due to zero intialisation paradigm
+    size build/linux-main | awk 'FNR == 2 { printf "text + data = %dkb\n", $4/1024 }'
+  fi
+
+  build_end_time=$(date +%s.%N)
+  build_time=$( echo "($build_end_time - $build_start_time)" | bc -l )
+
+  if [[ "$BUILD_TYPE" == "app" ]]; then 
+    printf "Build Time: %.4fs\n\n" "$build_time" 
+    printf "%.4f\n" "$build_time" >> misc/build-time.metric
+  else
+    printf "Build and Test Time: %.4fs\n\n" "$build_time" 
+  fi
+}
+
+push_dir() {
+  command pushd "$@" > /dev/null
+}
+
+pop_dir() {
+  command popd "$@" > /dev/null
+}
+
+
+if [[ "$OSTYPE" == "linux-gnu" ]]; then
+  os="linux"
+else
+  printf "Error: Build currently only supports linux\n" >&2
+  exit 1
+fi
+
+# NOTE(Ryan): This file is ignored by source control to allow tweaking of build params without affecting history
+source "private/build-params"
+param_compiler=${param_compiler:-"g++"}
+param_mode=${param_mode:-"debug"}
+param_arch=${param_arch:-"x86_64"}
+param_verbose=${param_verbose:-"0"}
+
+mkdir -p build run
+
+compiler_flags=()
+linker_flags=()
+
+# -finstrument-functions
+
+# If wanting to build assets, would say have the relevent 'project' files, e.g. .blend files
+# Then create output files, e.g. .obj files by running say blender $blendFile --background --python ExportBlenderAssets.py
+# Then appropriate directory copy: rsync -a --stats *.obj ../Collision
+# Probably also introduce a clean.sh script as well
+
+# TODO(Ryan): tracy runtime profiler: 
+# https://github.com/makuto/spargus-vehicle-prototype/tree/master/Profiling
+# TODO(Ryan): renderdoc gpu profiler 
+
+# ctags -x --c-kinds=f filename.c
+# awk 'NR > first && /^}$/ { print NR; exit }' first=$FIRST_LINE filename.c
+
+# must have universal ctags (maintained version of exuberant ctags)
+# ctags --fields=+ne -o - --sort=no foo.c
+
+if [[ "$param_arch" == "x86_64" && "$param_compiler" == "g++" && "$os" == "linux" ]]; then
+
+  # IMPORTANT(Ryan): Unfortunately new errors aren't added to -Wall and -Wextra for backwards compatibility
+
+  # IMPORTANT(Ryan): Only enable "-Werror" for CI builds, as different toolchains give warnings for different things
+  # such differences exacerbated with toolchain updates
+  # clang -Weverything will be affected by toolchain updates adding new warnings
+
+  # NOTE(Ryan): Enable various warnings largely related to implicit signed, alignment, casting, promotion issues
+  compiler_flags+=( "-Wall" "-Wextra" "-Wshadow" "-Wconversion" "-Wdouble-promotion" "-Wformat=2" "-pedantic" )
+  compiler_flags+=( "-Wundef" "-Wshadow" "-Wpadded" "-fno-common" "-march=native" )
+  compiler_flags+=( "-Wfloat-equal" "-Wlogical-op" "-Wredundant-decls" "-Wstrict-overflow=2" "-Warray-bounds=2" )
+  compiler_flags+=( "-Wwrite-strings" "-Wpointer-arith" "-Wformat-truncation" "-Wmissing-include-dirs" )
+  compiler_flags+=( "-Wcast-align" "-Wswitch-enum" "-Wsign-conversion" "-Wdisabled-optimization" )
+  compiler_flags+=( "-Winline" "-Wmissing-declarations" "-Wdouble-promotion" "-Wshadow" "-Wtrampolines" )
+  compiler_flags+=( "-Wvector-operation-performance" "-Wnull-dereference" "-Winvalid-pch" )
+  compiler_flags+=( "-Wduplicated-cond" "-Wshift-overflow=2" "-Wcast-align=strict" )
+
+  # NOTE(Ryan): Display the specific warning flag so we can ignore it if needed
+  compiler_flags+=( "-fdiagnostics-show-option")
+
+  # NOTE(Ryan): Ignored warnings
+  compiler_flags+=( "-Wno-unknown-pragmas" "-Wno-missing-field-initializers" "-Wno-cast-align" "-Wno-useless-cast" "-Wno-comment" "-Wno-missing-declarations" )
+  compiler_flags+=( "-Wno-parentheses" "-Wno-conversion" "-Wno-padded" )
+  # TODO(Ryan): Perhaps disable some cast types and keep some, e.g. -Wdouble-promotion
+
+  # NOTE(Ryan): C++ specific
+  compiler_flags+=( "-std=c++2a" "-fno-exceptions" "-fno-rtti" "-Wctor-dtor-privacy" )
+  compiler_flags+=( "-Wstrict-null-sentinel" "-Wzero-as-null-pointer-constant" )
+
+  compiler_flags+=( "-I code" "-isystem external" )
+
+  linker_flags+=( "-lm" "-lSDL2" "-lSDL2_image" "-lSDL2_ttf" "-lSDL2_mixer" "-ldl" "-lGL" "-lGLEW" )
+
+  # use for embedded, as will take into account region names specified in a linker script
+  # compiler_flags+=( "-Wl,--print-memory-usage" )
+  # -Wl,-Map=build/main.map 
+  # for embedded use -specs=nano.specs to get nano variant of newlib
+  # newlib only includes ISO C, not any POSIX etc.
+  # https://interrupt.memfault.com/blog/get-the-most-out-of-the-linker-map-file
+  # -Wl,-Map=${PROJECT_NAME}.map,--cref 
+
+  if [[ "$param_mode" == "debug" ]]; then
+    compiler_flags+=( "-DMAIN_DEBUG" )
+
+    # NOTE(Ryan): -g3 gives macro definitions
+    compiler_flags+=( "-g3" "-gdwarf-2" "-O0" )
+
+    compiler_flags+=("-Wno-unused-function" "-Wno-unused-variable"  "-Wno-unused-but-set-variable" "-Wno-unused-parameter" "-Wno-unused-result" ) 
+
+    # compiler_flags+=( "-fsanitize=address,undefined" "-fno-sanitize=float-divide-by-zero,float-cast-overflow" "-fno-sanitize-recover=all" )
+
+    # IMPORTANT(Ryan): static analysis requires gcc-10
+    # IMPORTANT(Ryan): significantly increases compilation time
+    # compiler_flags+=( "-fanalyzer" )
+
+    # NOTE(Ryan): The \x part specifies any ascii character
+    # rg --no-line-number --only-matching "\[\-W[\x00-\x7F]+\]" warnings.txt | sort | uniq
+    
+    # IMPORTANT(Ryan): Replace gcov binary to new symlink when updated gcc as well
+
+    # IMPORTANT(Ryan): Only run tests on debug builds
+    if [[ "$BUILD_TYPE" == "tests" ]]; then
+      mkdir -p lib
+      # for getting coverage information even if doing dlopen()
+      # -Wl --dynamic-list-data 
+
+      # IMPORTANT(Ryan): Don't incur cost of cmake checking
+      if [[ ! -f lib/libcmocka.so ]]; then
+       # IMPORTANT(Ryan): grep for option() in *.cmake
+       mkdir -p external/cmocka/build
+       cmake external/cmocka -DCMAKE_BUILD_TYPE=Debug -DWITH_EXAMPLES=OFF -DUNIT_TESTING=OFF \
+         -Bexternal/cmocka/build
+       cmake --build external/cmocka/build -j $(getconf _NPROCESSORS_ONLN)
+       cp external/cmocka/build/src/libcmocka.so lib/
+      fi
+
+      g++ -DMAIN_TEST --coverage ${compiler_flags[*]} \
+        code/linux-main.cpp -o build/linux-main-test ${linker_flags[*]}
+      # NOTE(Ryan): gcov complains if overriding existing .gcda files
+      rm -f linux-main.gcda
+      # find -name '*.gcda' -exec rm {} +
+      push_dir run
+      ../build/linux-main-test
+      pop_dir
+      gcov -b -o . code/linux-main.cpp >/dev/null
+      gcovr -e ".*\.h"
+
+      print_metrics
+    else
+      g++ ${compiler_flags[*]} code/linux-main.cpp -o build/linux-main ${linker_flags[*]}
+
+      g++ ${compiler_flags[*]} code/app.cpp -shared -fPIC -o run/app.so ${linker_flags[*]}
+
+      # print_metrics
+
+      # push_dir run
+      # ../build/linux-main
+      # pop_dir
+    fi
+    # find . -name '*.gcov' -and -not -name 'linux-main.cpp.gcov' -exec rm {} +
+    
+    # get debug and optimisation flags $(readelf -w build/server | grep producer)
+    
+    # pragma warning(disable: 4201) // nonstandard extension used: nameless struct/union
+    
+  elif [[ "$param_mode" == "release" ]]; then
+    compiler_flags+=( "-DMAIN_RELEASE" )
+    compiler_flags+=( "-O3" )
+    compiler_flags+=( "-ffunction-sections" "-fdata-sections" ) 
+
+    # IMPORTANT(Ryan): Should not be used for embedded as it may inline pieces of code and place
+    # them in the same memory region.
+    # also may increase stack usage
+    compiler_flags+=( "-flto" )
+
+    compiler_flags+=( "-ffast-math" )
+
+    # pointer analysis; large compile times
+    compiler_flags+=( "-fipa-pta" )
+    
+    # NOTE(Ryan): C++ specific attempt to convert calls to virtual functions to direct calls
+    compiler_flags+=( "-fdevirtualize-at-ltrans" )
+
+    linker_flags+=( "-Wl,--gc-sections" )
+
+    g++ ${compiler_flags[*]} code/linux-main.cpp -o build/linux-main ${linker_flags[*]}
+
+    # print_metrics
+
+    push_dir run
+    ../build/linux-main
+    pop_dir
+
+  else
+    printf "Error: Build currently only supports debug and release modes\n" >&2
+    exit 1
+  fi
+else
+  printf "Error: Build currently only supports x86_64 g++ on linux\n" >&2
+  exit 1
+fi
+
+# for major in {1..4}; do
+
+# IMPORTANT(Ryan): This ensures runs, even if script is interrupted
+# scratch=$(mktemp -d -t tmp.XXXXXXXXXX)
+# function finish {
+#   rm -rf "$scratch"
+# }
+# # bash EXIT pseudo signal
+# trap finish EXIT

@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: zlib-acknowledgement
+
+*
+
+!.gitignore
+
+!*/
+!code/**/*.cpp
+!code/**/*.[ch]
+!external/**/*.cpp
+!external/**/*.[ch]
+
+!misc/**/*
+
+!.circleci/config.yml
